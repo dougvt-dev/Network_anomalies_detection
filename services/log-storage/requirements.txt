@@ -1,0 +1,7 @@
+fastapi==0.104.0
+uvicorn[standard]==0.24.0
+influxdb-client==1.18.0
+elasticsearch>=8.10,<9.0
+clickhouse-driver==0.4.8
+pydantic==2.0.0
+python-dotenv==1.0.0

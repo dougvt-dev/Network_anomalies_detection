@@ -1,0 +1,187 @@
+version: '3.8'
+
+services:
+# ===== Microservices (Placeholder) =====
+  # === Packet Capture Service ===
+  # tshark trên card mạng của host -> Kafka packets_raw (API port 5001 trên host)
+  packet-capture:
+    build: ./services/packet-capture
+    container_name: packet-capture
+    depends_on:
+      - kafka
+    env_file: ./services/packet-capture/.env
+    environment:
+      - KAFKA_BROKERS=localhost:9092
+    cap_add:
+      - NET_ADMIN
+      - NET_RAW
+    network_mode: host
+    restart: unless-stopped
+    volumes:
+      - ./services/packet-capture/src:/app/src
+
+  # === Packet Normalizer Service ===
+  # Kafka packets_raw -> chuẩn hóa -> packets_normalized (scale bằng: --scale packet-normalizer=N)
+  packet-normalizer:
+    build: ./services/packet-normalizer
+    depends_on:
+      - kafka
+    env_file: ./services/packet-normalizer/.env
+    environment:
+      - KAFKA_BROKERS=kafka:29092
+    restart: unless-stopped
+    volumes:
+      - ./services/packet-normalizer/src:/app/src
+    networks:
+      - network-ai
+
+
+  # === Anomaly Detection Service ===
+  # Kafka packets_normalized -> phát hiện theo cửa sổ -> anomalies (+ host_features)
+  anomaly-detection:
+    build: ./services/anomaly-detection
+    depends_on:
+      - kafka
+    env_file: ./services/anomaly-detection/.env
+    environment:
+      - KAFKA_BROKERS=kafka:29092
+    restart: unless-stopped
+    volumes:
+      - ./services/anomaly-detection/src:/app/src
+      - ./services/anomaly-detection/config:/app/config
+    networks:
+      - network-ai
+
+  # === AI Agent Service ===
+  # anomalies -> phân tích (LLM) -> xin duyệt (Telegram/API) -> decisions; report lưu tại ./services/ai-agent/reports
+  ai-agent:
+    build: ./services/ai-agent
+    container_name: ai-agent
+    ports:
+      - "127.0.0.1:5003:5003"      # API duyệt: chỉ mở trên máy chủ, không ra mạng ngoài
+    depends_on:
+      - kafka
+    env_file: ./services/ai-agent/.env
+    environment:
+      - KAFKA_BROKERS=kafka:29092
+      - API_HOST=0.0.0.0           # trong container; giới hạn truy cập bằng port mapping ở trên
+      # Ollama chạy trên máy host; đổi sang vLLM: LLM_PROVIDER=vllm, LLM_BASE_URL=http://<vllm>:8000/v1
+      - LLM_BASE_URL=http://host.docker.internal:11434/v1
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    restart: unless-stopped
+    volumes:
+      - ./services/ai-agent/src:/app/src
+      - ./services/ai-agent/config:/app/config
+      - ./services/ai-agent/reports:/app/reports
+    networks:
+      - network-ai
+
+  # === Knowledge Base Service ===
+  knowledge-base:
+    build: ./services/knowledge-base
+    container_name: knowledge-base
+    ports:
+      - "5004:5004"
+    depends_on:
+      - redis
+    environment:
+      - REDIS_URL=redis://redis:6379
+      - LOG_LEVEL=INFO
+    volumes:
+      - ./services/knowledge-base:/app
+    networks:
+      - network-ai
+
+  # === Log Storage Service ===
+  log-storage:
+    build: ./services/log-storage
+    container_name: log-storage
+    ports:
+      - "5005:5005"
+    depends_on:
+      - influxdb
+      - elasticsearch
+      - clickhouse
+    environment:
+      - INFLUXDB_URL=http://influxdb:8086
+      - ELASTICSEARCH_URL=http://elasticsearch:9200
+      - CLICKHOUSE_URL=http://clickhouse:8123
+      - LOG_LEVEL=INFO
+    volumes:
+      - ./services/log-storage:/app
+    networks:
+      - network-ai
+
+  # === Action Service ===
+  action-service:
+    build: ./services/action-service
+    container_name: action-service
+    ports:
+      - "5006:5006"
+    depends_on:
+      - kafka
+    environment:
+      - KAFKA_BROKER=kafka:29092
+      - LOG_LEVEL=INFO
+    privileged: true
+    volumes:
+      - ./services/action-service:/app
+    networks:
+      - network-ai
+
+  # === Metrics Monitor Service ===
+  metrics-monitor:
+    build: ./services/metrics-monitor
+    container_name: metrics-monitor
+    ports:
+      - "5007:5007"
+    depends_on:
+      - kafka
+    environment:
+      - KAFKA_BROKER=kafka:29092
+      - PROMETHEUS_URL=http://prometheus:9090
+      - LOG_LEVEL=INFO
+    volumes:
+      - ./services/metrics-monitor:/app
+    networks:
+      - network-ai
+
+  # === API Gateway ===
+  api-gateway:
+    build: ./services/api-gateway
+    container_name: api-gateway
+    ports:
+      - "8000:8000"
+    depends_on:
+      - packet-capture
+      - anomaly-detection
+      - ai-agent
+      - knowledge-base
+      - log-storage
+      - action-service
+      - metrics-monitor
+    environment:
+      - PACKET_SERVICE=http://packet-capture:5001
+      - ANOMALY_SERVICE=http://anomaly-detection:5002
+      - AI_SERVICE=http://ai-agent:5003
+      - KB_SERVICE=http://knowledge-base:5004
+      - LOG_SERVICE=http://log-storage:5005
+      - ACTION_SERVICE=http://action-service:5006
+      - METRICS_SERVICE=http://metrics-monitor:5007
+      - LOG_LEVEL=INFO
+    volumes:
+      - ./services/api-gateway:/app
+    networks:
+      - network-ai
+
+volumes:
+  influxdb_data:
+  elasticsearch_data:
+  clickhouse_data:
+  prometheus_data:
+  grafana_data:
+
+networks:
+  network-ai:
+    driver: bridge

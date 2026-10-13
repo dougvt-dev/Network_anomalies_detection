@@ -1,0 +1,77 @@
+# Chính sách của ai-agent: phân loại, đề xuất hành động, giới hạn an toàn, report.
+
+incident:
+  idle_close_seconds: 1800         # thiết bị không có cảnh báo mới trong ngần này giây thì đóng sự cố
+  history_seconds: 86400           # giữ lịch sử sự cố đã đóng (dùng làm bối cảnh cho phân tích)
+
+# Thông tin về tài sản trong mạng
+assets:
+  - ip: 192.168.1.1
+    name: gateway
+    critical: true                 # cảnh báo liên quan tới tài sản này được nâng priority
+    never_block: true              # không bao giờ đề xuất chặn
+  - ip: 8.8.8.8
+    name: public-dns
+    never_block: true
+
+# Hành vi hợp lệ đã biết: cảnh báo khớp sẽ được đánh dấu benign, không đề xuất hành động
+expected_behavior: []
+#  - ip: 192.168.1.250
+#    categories: [port_scan, host_sweep]
+#    reason: Authorized vulnerability scanner
+
+triage:
+  # Loại nguy hiểm: cộng 1 bậc priority
+  high_risk_categories: [arp_spoofing, data_exfiltration, dns_tunneling]
+  recurrence_threshold: 3          # cảnh báo lặp lại >= ngần này lần (occurrences) thì cộng 1 bậc
+
+# MITRE ATT&CK cho từng loại bất thường
+mitre:
+  port_scan:            {tactic: Discovery,         technique: T1046,     name: Network Service Discovery}
+  host_sweep:           {tactic: Discovery,         technique: T1018,     name: Remote System Discovery}
+  inbound_scan:         {tactic: Reconnaissance,    technique: T1595,     name: Active Scanning}
+  brute_force:          {tactic: Credential Access, technique: T1110,     name: Brute Force}
+  arp_spoofing:         {tactic: Credential Access, technique: T1557.002, name: ARP Cache Poisoning}
+  dns_tunneling:        {tactic: Command and Control, technique: T1071.004, name: "Application Layer Protocol: DNS"}
+  dga:                  {tactic: Command and Control, technique: T1568.002, name: Domain Generation Algorithms}
+  dos:                  {tactic: Impact,            technique: T1498,     name: Network Denial of Service}
+  data_exfiltration:    {tactic: Exfiltration,      technique: T1041,     name: Exfiltration Over C2 Channel}
+  traffic_spike:        {tactic: Impact,            technique: T1498,     name: Network Denial of Service}
+  unusual_destinations: {tactic: Discovery,         technique: T1018,     name: Remote System Discovery}
+  dns_anomaly:          {tactic: Command and Control, technique: T1071.004, name: "Application Layer Protocol: DNS"}
+
+# Hành động được phép đề xuất cho từng loại. LLM chỉ được chọn trong danh sách này.
+#   alert     : chỉ thông báo cho người quản trị
+#   block_ip  : chặn IP tại gateway (cần duyệt) — target lấy theo `target`
+#   block_mac : chặn MAC tại gateway (cần duyệt)
+# target: entity_ip (thiết bị bất thường) | entity_mac | probe_source (IP bên ngoài đang quét vào)
+policy:
+  default: {actions: [alert]}
+  categories:
+    port_scan:            {actions: [alert, block_ip],  target: entity_ip}
+    host_sweep:           {actions: [alert, block_ip],  target: entity_ip}
+    brute_force:          {actions: [alert, block_ip],  target: entity_ip}
+    dos:                  {actions: [alert, block_ip],  target: entity_ip}
+    dns_tunneling:        {actions: [alert, block_ip],  target: entity_ip}
+    dga:                  {actions: [alert, block_ip],  target: entity_ip}
+    data_exfiltration:    {actions: [alert, block_ip],  target: entity_ip}
+    inbound_scan:         {actions: [alert, block_ip],  target: probe_source}
+    arp_spoofing:         {actions: [alert, block_mac], target: entity_mac}
+  block_max_priority: P2           # chỉ đề xuất chặn khi priority từ P2 trở lên (P1, P2)
+  block_duration_seconds: {P1: 3600, P2: 1800}
+
+guardrails:
+  max_block_proposals_per_hour: 10 # quá số này thì chỉ alert
+  max_block_seconds: 86400
+
+approval:
+  timeout_seconds: 1800            # quá hạn chưa duyệt: hết hiệu lực, KHÔNG thực thi
+
+analysis:
+  use_llm: true                    # false: luôn dùng mẫu văn bản
+  queue_size: 100
+
+reports:
+  hourly: true
+  daily: true
+  keep_days: 30

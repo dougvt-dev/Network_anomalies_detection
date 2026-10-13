@@ -1,0 +1,4 @@
+-r requirements.txt
+pytest==9.1.1
+# Chỉ cần khi sinh lại fixture (tests/attack_traffic.py)
+scapy==2.7.0
