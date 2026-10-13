@@ -1,615 +1,170 @@
-# Network AI Agent Monitoring System
-## 📌 **Tóm Tắt Dự Án**
- 
-### **Mục Tiêu**
-Xây dựng hệ thống **AI Agent giám sát mạng real-time** dùng microservice, có khả năng:
-- ✅ Bắt toàn bộ traffic từ interface `eth0`
-- ✅ Phát hiện bất thường tự động (ML)
-- ✅ Suy luận thông minh (ReAct + LLM)
-- ✅ Thực thi hành động tự động (Block IP, Alert, etc.)
-- ✅ Lưu trữ & phân tích dữ liệu
-### **Kết Quả Cuối Cùng**
+# Network AI Agent
+
+Hệ thống giám sát mạng theo kiến trúc microservice. Hệ thống bắt traffic của các thiết bị trong mạng LAN, phát hiện hành vi bất thường của từng thiết bị, rồi dùng LLM giải thích cho người quản trị và đề xuất hành động. **Mọi lệnh chặn đều phải được người quản trị duyệt qua Telegram trước khi thực thi.**
+
 ```
-┌─────────────┐
-│   eth0      │  Raw Traffic
-└──────┬──────┘
-       │
-       ▼
-┌──────────────────────────────────────────┐
-│   Microservice Architecture              │
-│  - 8 Services + Infrastructure           │
-│  - Real-time Event Processing            │
-│  - AI-powered Decision Making            │
-└──────────────────────────────────────────┘
-       │
-       ▼
-┌─────────────────────────────────────┐
-│  Real-time Monitoring Dashboard     │
-│  - Web UI (React)                   │
-│  - Grafana (Metrics)                │
-│  - Alert System                     │
-└─────────────────────────────────────┘
+[Thiết bị LAN] ──▶ [Máy thu / gateway] ──NAT──▶ Internet
+                          │ tshark (card phía LAN)
+                          ▼
+ packet-capture ──▶ packets_raw ──▶ packet-normalizer ──▶ packets_normalized
+                                                                │
+                                                                ▼
+                                    host_features ◀── anomaly-detection
+                                                                │
+                                                                ▼ anomalies
+                                                           ai-agent ◀──▶ LLM (Ollama / vLLM)
+                                                                │  ▲
+                                         Telegram duyệt ◀───────┘  │ action_results
+                                                                │  │
+                                                                ▼ decisions (chỉ lệnh đã duyệt)
+                                                          action-service (chưa xây)
 ```
- 
----
-## 1️⃣ High-Level System Overview
- 
+
+Các service giao tiếp với nhau qua **Kafka**. Mỗi service chỉ làm một bước, có thể chạy và test riêng, và có công cụ `dump` để chạy offline trên file JSONL mà không cần Kafka.
+
+## Trạng thái các service
+
+| Service | Trạng thái | Vai trò | Vào → Ra |
+|---|---|---|---|
+| [packet-capture](services/packet-capture/README.md) | ✅ Đã xây | Bắt gói bằng tshark (card mạng hoặc replay file pcap), chỉ lấy metadata, không lưu payload | card mạng / pcap → `packets_raw` |
+| [packet-normalizer](services/packet-normalizer/README.md) | ✅ Đã xây | Ép kiểu, xác định chiều traffic so với LAN, `flow_id`, metadata DNS/TLS/HTTP/ARP | `packets_raw` → `packets_normalized` |
+| [anomaly-detection](services/anomaly-detection/README.md) | ✅ Giai đoạn 1 | Gom hành vi theo thiết bị trong cửa sổ 60 giây; phát hiện bằng rule + ARP + baseline EWMA; chấm điểm, chống spam | `packets_normalized` → `anomalies`, `host_features` |
+| [ai-agent](services/ai-agent/README.md) | ✅ Đã xây | Gộp sự cố, phân loại P1–P4, LLM giải thích, đề xuất theo chính sách + guardrails, xin duyệt qua Telegram, report định kỳ | `anomalies` → `decisions` |
+| action-service | ⏳ Khung | Chạy trên gateway, thực thi lệnh chặn đã duyệt (bắt đầu ở chế độ dry-run) | `decisions` → `action_results` |
+| log-storage | ⏳ Khung | Lưu cảnh báo, gom thành sự cố, API tra lịch sử thiết bị | |
+| knowledge-base | ⏳ Khung | Tri thức (CVE, threat intel) cho agent | |
+| metrics-monitor | ⏳ Khung | Metrics Prometheus | |
+| api-gateway | ⏳ Khung | Điểm truy cập chung | |
+
+"Khung" nghĩa là service mới chỉ có endpoint `/health`.
+
+## Các topic Kafka
+
+| Topic | Producer → Consumer | Key | Thời gian giữ |
+|---|---|---|---|
+| `packets_raw` | packet-capture → packet-normalizer | IP nguồn (hoặc MAC) | 6 giờ |
+| `packets_normalized` | packet-normalizer → anomaly-detection | IP của thiết bị LAN | 3 ngày |
+| `anomalies` | anomaly-detection → ai-agent | IP/MAC thiết bị | 30 ngày |
+| `host_features` | anomaly-detection → (dữ liệu train ML ở giai đoạn 2) | IP thiết bị | 7 ngày |
+| `decisions` | ai-agent → action-service | | |
+| `action_results` | action-service → ai-agent | | |
+
+Định dạng chi tiết của từng topic nằm trong README của service tạo ra topic đó.
+
+## Mô hình triển khai
+
+Máy thu là một **máy Linux chạy trực tiếp** (không dùng WSL), làm gateway và phát mạng (Wi-Fi hotspot hoặc LAN) cho các thiết bị cần giám sát. tshark bắt gói ở card phía LAN, trước NAT, nên thấy được IP thật của từng thiết bị. Cách dựng hotspot có trong [README packet-capture](services/packet-capture/README.md#mô-hình-triển-khai-máy-thu-làm-gateway).
+
+Máy dev chạy WSL2 nên không làm gateway được. Trên máy dev, dùng chế độ replay file pcap hoặc các công cụ `dump`.
+
+> Chỉ giám sát thiết bị của mình hoặc thiết bị đã đồng ý.
+
+## Cấu trúc thư mục
+
 ```
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                         NETWORK AI AGENT SYSTEM                             │
-└─────────────────────────────────────────────────────────────────────────────┘
- 
-┌──────────────────────┐
-│    eth0 Interface    │  (Raw network traffic)
-│   10,000+ pkt/sec    │
-└──────────┬───────────┘
-           │
-           │ TShark
-           ▼
-┌──────────────────────────────────────────────────────────────┐
-│         PACKET CAPTURE SERVICE (Port 5001)                  │
-│  ┌─────────────────────────────────────────────────────┐    │
-│  │ - Parse packets to JSON                             │    │
-│  │ - Quick ML filter (Isolation Forest)                │    │
-│  │ - Drop 95% normal packets                           │    │
-│  │ - Send 5% suspicious → Kafka                        │    │
-│  └─────────────────────────────────────────────────────┘    │
-└────────────────────┬─────────────────────────────────────────┘
-                     │
-                     │ Kafka topic: "packets_raw"
-                     ▼
-┌──────────────────────────────────────────────────────────────┐
-│      ANOMALY DETECTION SERVICE (Port 5002)                  │
-│  ┌─────────────────────────────────────────────────────┐    │
-│  │ - Isolation Forest model (sklearn)                  │    │
-│  │ - Score: 0.0 ~ 1.0                                 │    │
-│  │ - Send anomalies (score > 0.7) → Kafka            │    │
-│  └─────────────────────────────────────────────────────┘    │
-└────────────────────┬─────────────────────────────────────────┘
-                     │
-                     │ Kafka topic: "anomalies"
-                     ▼
-         ┌───────────────────────┐
-         │  AI AGENT SERVICE     │  (Port 5003)
-         │                       │
-         │   ╔═════════════════╗ │
-         │   ║  ReAct Loop     ║ │
-         │   ╠═════════════════╣ │
-         │   ║ 1. Receive      ║ │
-         │   ║ 2. Think        ║ │
-         │   ║ 3. Act (→ KB)   ║ │
-         │   ║ 4. Observe      ║ │
-         │   ║ 5. Decide       ║ │
-         │   ╚═════════════════╝ │
-         │                       │
-         │   LLM: Mistral-7B    │
-         └───────────┬───────────┘
-                     │
-        ┌────────────┴────────────┐
-        │                         │
-        ▼                         ▼
-    ┌─────────────┐      ┌──────────────────┐
-    │ Knowledge   │      │  Log Storage     │
-    │   Base      │      │  (Historical)    │
-    │ (ChromaDB)  │      │  (Query previous)│
-    │  CVE, TTI   │      │  anomalies)      │
-    └─────────────┘      └──────────────────┘
-        │                         │
-        └────────────┬────────────┘
-                     │
-                     │ Kafka topic: "decisions"
-                     ▼
-┌──────────────────────────────────────────────────────────────┐
-│        ACTION SERVICE (Port 5006)                            │
-│  ┌─────────────────────────────────────────────────────┐    │
-│  │ Executes decisions:                                 │    │
-│  │ - Block IP (iptables)                              │    │
-│  │ - Alert (Slack/Email)                              │    │
-│  │ - Log (ClickHouse)                                 │    │
-│  │ - Monitor (increase level)                         │    │
-│  └─────────────────────────────────────────────────────┘    │
-└────────────────────┬─────────────────────────────────────────┘
-                     │
-        ┌────────────┼────────────┐
-        ▼            ▼            ▼
-    ┌────────┐  ┌───────┐  ┌──────────┐
-    │Firewall│  │Alerts │  │Database  │
-    │(Linux) │  │(Slack)│  │(Storage) │
-    └────────┘  └───────┘  └──────────┘
+project/
+├── docker-compose.yml           # hạ tầng: Zookeeper, Kafka, Redis, InfluxDB, Elasticsearch, ClickHouse, Prometheus, Grafana
+├── docker-compose.service.yml   # các microservice (dùng kèm file trên)
+├── infrastructure/monitoring/prometheus.yml
+├── services/
+│   ├── packet-capture/
+│   ├── packet-normalizer/
+│   ├── anomaly-detection/
+│   ├── ai-agent/
+│   └── action-service/ log-storage/ knowledge-base/ metrics-monitor/ api-gateway/   # khung
+├── docs/                        # ghi chú thiết kế ban đầu (chưa cập nhật theo code)
+├── README_Docker.md             # lỗi mount prometheus.yml trên WSL
+└── README_tshark.md             # hướng dẫn nhanh tshark
 ```
- 
----
- 
-## 2️⃣ Detailed Service Communication
- 
+
+Các service đã xây đều theo cùng một bố cục:
+- `src/common/`: `config.py`, `kafka.py`, `log.py`.
+- `src/<tên>/`: `main.py` (worker hoặc API), `dump.py` (chạy offline), `schema.py` (định dạng đầu ra).
+- `tests/`: kèm fixture được sinh từ chính pipeline thật.
+- `.env.example`, `Dockerfile` (python:3.12-slim), `requirements.txt`, `requirements-dev.txt`.
+
+## Bắt đầu nhanh
+
+### 1. Môi trường dev
+
+```bash
+conda activate net_env
+for s in packet-capture packet-normalizer anomaly-detection ai-agent; do
+  pip install -r services/$s/requirements-dev.txt
+  cp -n services/$s/.env.example services/$s/.env     # rồi chỉnh theo máy
+done
 ```
-                    ┌─────────────────┐
-                    │  API Gateway    │
-                    │  (Port 8000)    │
-                    └────────┬────────┘
-                             │
-                ┌────────────┼────────────┐
-                │            │            │
-        ┌───────▼───┐ ┌──────▼──┐ ┌─────▼──────┐
-        │ Packet    │ │ AI      │ │ Log        │
-        │ Service   │ │ Agent   │ │ Storage    │
-        │ (5001)    │ │ (5003)  │ │ (5005)     │
-        └───────┬───┘ └──────┬──┘ └─────┬──────┘
-                │            │          │
-                │    ┌───────┼──────┐   │
-                │    │       │      │   │
-                ▼    ▼       ▼      ▼   ▼
-        ┌──────────────────────────────────────┐
-        │      Apache Kafka (Event Bus)        │
-        │  ┌─────────────────────────────┐    │
-        │  │ Topic: packets_raw (5%)     │    │
-        │  │ Topic: anomalies            │    │
-        │  │ Topic: decisions            │    │
-        │  │ Topic: alerts               │    │
-        │  │ Topic: logs                 │    │
-        │  └─────────────────────────────┘    │
-        └──────────────────────────────────────┘
-                │    │    │    │
-                │    │    │    └──────────────┐
-                │    │    │                   │
-                ▼    ▼    ▼                   ▼
-        ┌──────────────────┐         ┌──────────────┐
-        │ Data Storage     │         │ Monitoring   │
-        ├──────────────────┤         ├──────────────┤
-        │ - InfluxDB       │         │ - Prometheus │
-        │ - Elasticsearch  │         │ - Grafana    │
-        │ - ClickHouse     │         │ - AlertMgr   │
-        └──────────────────┘         └──────────────┘
+
+packet-capture cần tshark ≥ 4.x (`sudo apt install tshark`), và user phải thuộc nhóm `wireshark`.
+
+### 2. Chạy test (không cần Kafka, LLM hay Telegram)
+
+```bash
+for s in packet-capture packet-normalizer anomaly-detection ai-agent; do
+  (cd services/$s && python -m pytest -q)
+done
 ```
- 
----
- 
-## 3️⃣ Data Flow - Detailed
- 
+
+### 3. Chạy toàn bộ pipeline offline (không cần Kafka)
+
+Từ file pcap ra đề xuất của agent, nối các công cụ `dump` bằng pipe:
+
+```bash
+cd services
+(cd packet-capture/src    && python -m capture.dump /path/file.pcap) \
+  | (cd packet-normalizer/src  && python -m normalizer.dump) \
+  | (cd anomaly-detection/src  && python -m detection.dump) \
+  | (cd ai-agent/src           && python -m agent.dump)
 ```
-┌────────────────────────────────────────────────────────────────────────┐
-│                         PACKET LIFECYCLE                               │
-└────────────────────────────────────────────────────────────────────────┘
- 
-T=0ms
-┌─────────────────┐
-│ Raw eth0 packet │ (e.g., TCP 192.168.1.100:52341 → 8.8.8.8:443)
-└────────┬────────┘
-         │
-         │ tshark -i eth0 -T json
-         │ 1ms processing
-         ▼
-T=1ms
-┌──────────────────────────┐
-│ Structured JSON packet   │
-│ {                        │
-│   "src_ip": "192.168...", │
-│   "dst_ip": "8.8.8.8",   │
-│   "dst_port": 443,       │
-│   "protocol": "TCP",     │
-│   "size": 1234,          │
-│   "flags": [...],        │
-│   "timestamp": "..."     │
-│ }                        │
-└──────────┬───────────────┘
-           │
-           │ Kafka: packets_raw
-           │ 1ms latency
-           ▼
-T=2ms
-┌─────────────────────────┐
-│ Anomaly Detector (ML)   │
-│                         │
-│ Features extracted:     │
-│ - Packet frequency      │
-│ - Packet size dist      │
-│ - Port pattern          │
-│ - Time-series pattern   │
-│                         │
-│ Model: Isolation Forest │
-│ Score = 0.45 (Normal!)  │
-└──────────┬──────────────┘
-           │
-        95% │ (Normal packets - DROPPED)
-           │
-           │ 5% (Anomalous - score > 0.7)
-           │ 3ms processing
-           ▼
-T=5ms
-┌──────────────────────────┐
-│ Anomaly: DETECTED        │
-│ {                        │
-│   "score": 0.82,         │
-│   "reason": "Port spike",│
-│   "packet": {...},       │
-│   "severity": "HIGH"     │
-│ }                        │
-└──────────┬───────────────┘
-           │
-           │ Kafka: anomalies
-           │ 1ms latency
-           ▼
-T=6ms
-┌──────────────────────────────────────┐
-│ AI Agent - ReAct Loop                │
-│                                      │
-│ THOUGHT:                             │
-│ "Weird port 443 spike from 192.168"  │
-│                                      │
-│ ACTION 1: Query Knowledge Base       │
-│ KB: "No known CVE for this pattern"  │
-│                                      │
-│ ACTION 2: Query historical logs      │
-│ Logs: "Same IP does this daily 10am" │
-│                                      │
-│ OBSERVATION:                         │
-│ "Normal business traffic (cloud backup)"│
-│                                      │
-│ DECISION:                            │
-│ "ALLOW - Normal behavior"            │
-│                                      │
-│ Processing: 2ms (LLM inference)      │
-└──────────┬───────────────────────────┘
-           │
-           │ Kafka: decisions
-           │ 1ms latency
-           ▼
-T=10ms
-┌──────────────────────────┐
-│ Action Service           │
-│                          │
-│ Decision: ALLOW          │
-│ Action: LOG ONLY         │
-│                          │
-│ - Store to ClickHouse    │
-│ - Update Prometheus      │
-│ - Return to API          │
-│                          │
-│ Processing: 1ms          │
-└──────────┬───────────────┘
-           │
-      ┌────┴─────┬─────────┬──────────┐
-      │           │         │          │
-      ▼           ▼         ▼          ▼
-  ┌────────┐  ┌─────┐  ┌────────┐  ┌──────┐
-  │Database│  │Cache│  │Logs    │  │API   │
-  │Storage │  │Redis│  │Store   │  │Return│
-  └────────┘  └─────┘  └────────┘  └──────┘
- 
-TOTAL LATENCY: ~10ms (acceptable)
+
+Bộ dữ liệu tấn công mẫu có sẵn (8 kịch bản) ở `anomaly-detection/tests/fixtures/attack_scenarios.normalized.jsonl.gz`.
+
+### 4. Chạy bằng Docker Compose
+
+Luôn dùng cả hai file compose, vì các service phụ thuộc vào Kafka khai báo trong `docker-compose.yml`:
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.service.yml up -d \
+  zookeeper kafka packet-capture packet-normalizer anomaly-detection ai-agent
 ```
- 
----
- 
-## 4️⃣ Service Dependencies
- 
-```
-                        ┌─────────────────┐
-                        │  API Gateway    │
-                        │  (5000)         │
-                        └────────┬────────┘
-                                 │
-                ┌────────────────┼─────────────┐
-                │                │             │
-        ┌───────▼────┐   ┌──────▼────┐  ┌────▼──────┐
-        │  Packet    │   │   AI      │  │  Log      │
-        │  Capture   │   │  Agent    │  │ Storage   │
-        │  (5001)    │   │  (5003)   │  │  (5005)   │
-        └───────┬────┘   └──────┬────┘  └────┬──────┘
-                │               │             │
-                ├──depends on──→ Kafka        │
-                │               ├─depends on→ InfluxDB
-                │               │             ├─depends on→ Elasticsearch
-                │               │             └─depends on→ ClickHouse
-                │    ┌──────────▼──────────┐
-                │    │  Knowledge Base    │
-                │    │  (5004)            │
-                │    └──────────┬─────────┘
-                │               │
-                │    ┌──────────▼──────────┐
-                │    │  Redis (Cache)     │
-                │    └────────────────────┘
-                │
-        ┌───────▼────┐
-        │  Anomaly   │
-        │ Detection  │
-        │  (5002)    │
-        └───────┬────┘
-                │
-        ┌───────▼────┐
-        │   Action   │
-        │  Service   │
-        │  (5006)    │
-        └────────────┘
-```
- 
----
- 
-## 5️⃣ Docker Container Architecture
- 
-```
-┌────────────────────────────────────────────────────────┐
-│                  docker-compose network                │
-└────────────────────────────────────────────────────────┘
- 
-┌─────────────────────────────────────────────────────┐
-│ External (Host)                                     │
-│                                                     │
-│  eth0 ◄────── network_ai_agent container ────► │
-│              (host network mode)                   │
-└─────────────────────────────────────────────────────┘
- 
-        │
-        ▼ (Shared Network)
- 
-  Container Network: 172.18.0.0/16
- 
-┌───────────────────────────┬──────────────────────────────┐
-│   Infrastructure          │   Microservices             │
-│                           │                             │
-│ ┌─────────────────────┐   │ ┌───────────────────────┐   │
-│ │ Zookeeper           │   │ │ Packet Capture        │   │
-│ │ Port: 2181          │   │ │ Port: 5001           │   │
-│ │ Container IP: ...   │   │ │ Container IP: ...    │   │
-│ └─────────────────────┘   │ └───────────────────────┘   │
-│                           │                             │
-│ ┌─────────────────────┐   │ ┌───────────────────────┐   │
-│ │ Kafka               │   │ │ Anomaly Detection     │   │
-│ │ Port: 9092 (→29092) │   │ │ Port: 5002           │   │
-│ │ Container IP: ...   │   │ │ Container IP: ...    │   │
-│ └─────────────────────┘   │ └───────────────────────┘   │
-│                           │                             │
-│ ┌─────────────────────┐   │ ┌───────────────────────┐   │
-│ │ Redis               │   │ │ AI Agent              │   │
-│ │ Port: 6379          │   │ │ Port: 5003           │   │
-│ │ Container IP: ...   │   │ │ Container IP: ...    │   │
-│ └─────────────────────┘   │ └───────────────────────┘   │
-│                           │                             │
-│ ┌─────────────────────┐   │ ┌───────────────────────┐   │
-│ │ InfluxDB            │   │ │ Knowledge Base        │   │
-│ │ Port: 8086          │   │ │ Port: 5004           │   │
-│ │ Container IP: ...   │   │ │ Container IP: ...    │   │
-│ └─────────────────────┘   │ └───────────────────────┘   │
-│                           │                             │
-│ ┌─────────────────────┐   │ ┌───────────────────────┐   │
-│ │ Elasticsearch       │   │ │ Log Storage           │   │
-│ │ Port: 9200          │   │ │ Port: 5005           │   │
-│ │ Container IP: ...   │   │ │ Container IP: ...    │   │
-│ └─────────────────────┘   │ └───────────────────────┘   │
-│                           │                             │
-│ ┌─────────────────────┐   │ ┌───────────────────────┐   │
-│ │ ClickHouse          │   │ │ Action Service        │   │
-│ │ Port: 8123, 9000    │   │ │ Port: 5006           │   │
-│ │ Container IP: ...   │   │ │ Container IP: ...    │   │
-│ └─────────────────────┘   │ └───────────────────────┘   │
-│                           │                             │
-│ ┌─────────────────────┐   │ ┌───────────────────────┐   │
-│ │ Prometheus          │   │ │ Metrics Monitor       │   │
-│ │ Port: 9090          │   │ │ Port: 5007           │   │
-│ │ Container IP: ...   │   │ │ Container IP: ...    │   │
-│ └─────────────────────┘   │ └───────────────────────┘   │
-│                           │                             │
-│ ┌─────────────────────┐   │ ┌───────────────────────┐   │
-│ │ Grafana             │   │ │ API Gateway           │   │
-│ │ Port: 3000          │   │ │ Port: 8000           │   │
-│ │ Container IP: ...   │   │ │ Container IP: ...    │   │
-│ └─────────────────────┘   │ └───────────────────────┘   │
-│                           │                             │
-│ ┌─────────────────────┐   │                             │
-│ │ Kafka UI            │   │                             │
-│ │ Port: 8080          │   │                             │
-│ │ Container IP: ...   │   │                             │
-│ └─────────────────────┘   │                             │
-└───────────────────────────┴──────────────────────────────┘
-```
- 
----
- 
-## 6️⃣ ReAct Loop - AI Agent Flow
- 
-```
-┌─────────────────────────────────────────────────────────┐
-│              AI AGENT - ReAct Loop                      │
-└─────────────────────────────────────────────────────────┘
- 
-Anomaly Alert Received:
-{
-  "packet": {
-    "src_ip": "192.168.1.100",
-    "dst_ip": "1.2.3.4",
-    "dst_port": 8080,
-    "protocol": "TCP",
-    "size": 1024
-  },
-  "score": 0.82,
-  "reason": "Unknown destination, unusual port"
-}
- 
-    ▼
- 
-┌────────────────────────────────────────┐
-│  STEP 1: THOUGHT                       │
-│                                        │
-│ "This traffic is unusual:              │
-│  - IP is not in known list             │
-│  - Port 8080 is uncommon               │
-│  - Could be malware C&C                │
-│  - Or could be legitimate app update   │
-│                                        │
-│ I need more information before deciding"│
-└────────────────┬───────────────────────┘
-                 │
-                 ▼
-┌────────────────────────────────────────┐
-│  STEP 2: ACTION                        │
-│                                        │
-│  Tools available:                      │
-│  1. query_knowledge_base(payload)      │
-│  2. lookup_geolocation(ip)             │
-│  3. check_threat_intelligence(ip)      │
-│  4. query_historical_logs(ip)          │
-│  5. dns_reverse_lookup(ip)             │
-│                                        │
-│  Choosing: query_knowledge_base()      │
-│  Query: "Port 8080 TCP malware"        │
-└────────────────┬───────────────────────┘
-                 │
-                 ▼
-┌────────────────────────────────────────┐
-│  STEP 3: OBSERVATION                   │
-│                                        │
-│  Knowledge Base returned:              │
-│  - Matches: "Zeus botnet C&C"          │
-│  - Risk: CRITICAL                      │
-│  - Confidence: 73%                     │
-│  - IOCs: [similar IPs]                 │
-└────────────────┬───────────────────────┘
-                 │
-                 ▼
-┌────────────────────────────────────────┐
-│  STEP 4: ACTION (continued)            │
-│                                        │
-│  Too risky! Need to verify.            │
-│  Choosing: lookup_geolocation(1.2.3.4)│
-└────────────────┬───────────────────────┘
-                 │
-                 ▼
-┌────────────────────────────────────────┐
-│  STEP 5: OBSERVATION (continued)       │
-│                                        │
-│  GeoIP returned:                       │
-│  - Country: CN (China)                 │
-│  - ASN: Suspicious (known botnet)      │
-│  - Reputation: MALICIOUS               │
-└────────────────┬───────────────────────┘
-                 │
-                 ▼
-┌────────────────────────────────────────┐
-│  STEP 6: ACTION (continued)            │
-│                                        │
-│  Still need to check: is this user     │
-│  supposed to connect to China?         │
-│  Choosing: query_historical_logs()     │
-│  Query: "192.168.1.100 connections"    │
-└────────────────┬───────────────────────┘
-                 │
-                 ▼
-┌────────────────────────────────────────┐
-│  STEP 7: OBSERVATION (final)           │
-│                                        │
-│  Historical logs show:                 │
-│  - No previous connections to China    │
-│  - All traffic usually to US CDN       │
-│  - Sudden change is suspicious         │
-│  - Confidence: 95%                     │
-└────────────────┬───────────────────────┘
-                 │
-                 ▼
-┌────────────────────────────────────────┐
-│  STEP 8: FINAL ANSWER                  │
-│                                        │
-│  DECISION: BLOCK                       │
-│                                        │
-│  Reasoning:                            │
-│  1. Matches malware signature (KB)     │
-│  2. GeoIP shows malicious region       │
-│  3. No historical precedent            │
-│  4. High confidence (95%)              │
-│                                        │
-│  Actions to take:                      │
-│  ├─ BLOCK: Add to firewall blacklist   │
-│  ├─ ALERT: Notify security team        │
-│  ├─ MONITOR: Increase logging          │
-│  └─ FORENSIC: Deep packet inspection   │
-│                                        │
-│  Confidence Score: 0.95                │
-│  Risk Level: CRITICAL                  │
-└────────────────┬───────────────────────┘
-                 │
-                 ▼
-    Decision published to Kafka
-    Action Service executes decision
-```
- 
----
- 
-## 7️⃣ Performance Timeline (Per Packet)
- 
-```
-Timeline: T=0 → T=10ms (Target)
- 
-T=0ms     ├─ TShark captures packet from eth0
-          │
-T=1ms     ├─ JSON parsing complete → Kafka (packets_raw)
-          │
-T=2ms     ├─ Anomaly Detection begins
-          │  ├─ Feature extraction
-          │  ├─ Model inference (Isolation Forest)
-          │  └─ Score calculation (0.82)
-          │
-T=5ms     ├─ Anomaly detected → Kafka (anomalies)
-          │
-T=6ms     ├─ AI Agent receives anomaly
-          │  ├─ Load prompt & context
-          │  ├─ Query Knowledge Base
-          │  ├─ Query historical logs
-          │  └─ LLM inference (2ms)
-          │
-T=10ms    ├─ Decision published → Kafka (decisions)
-          │
-T=11ms    ├─ Action Service receives decision
-          │  ├─ Execute action (firewall, alert)
-          │  └─ Log to storage
-          │
-T=12ms    └─ Complete! Ready for next packet
- 
-Total: ~10-12ms per packet (handling ~100+ anomalies/sec)
-```
- 
----
- 
-## 8️⃣ Storage & Persistence
- 
-```
-                    ┌───────────────────┐
-                    │ Incoming Decisions │
-                    └──────────┬────────┘
-                               │
-                  ┌────────────┼────────────┐
-                  │            │            │
-                  ▼            ▼            ▼
-        ┌──────────────┐ ┌────────────┐ ┌──────────────┐
-        │ InfluxDB     │ │ Elasticsearch│ │ ClickHouse   │
-        │ (Time-Series)│ │ (Search)   │ │ (Analytics)  │
-        ├──────────────┤ ├────────────┤ ├──────────────┤
-        │              │ │            │ │              │
-        │ Stores:      │ │ Stores:    │ │ Stores:      │
-        │ - Metrics    │ │ - Alerts   │ │ - Summaries  │
-        │ - Packets    │ │ - Logs     │ │ - Reports    │
-        │ - Anomalies  │ │ - Actions  │ │ - Trends     │
-        │ - Latencies  │ │            │ │              │
-        │              │ │ Retention: │ │ Retention:   │
-        │ Retention:   │ │ 30 days    │ │ 1 year       │
-        │ 7 days       │ │            │ │              │
-        │              │ │ Speed: <1s │ │ Speed: <5s   │
-        │ Speed:       │ │            │ │              │
-        │ ~50ms        │ │ Query type:│ │ Query type:  │
-        │              │ │ Full text  │ │ Aggregations │
-        │ Query type:  │ │ search     │ │ Reports      │
-        │ Time-range   │ │            │ │              │
-        │              │ │            │ │              │
-        └──────────────┘ └────────────┘ └──────────────┘
-```
- 
----
- 
-**This architecture provides:**
-- ✅ Real-time packet processing
-- ✅ Low latency (< 10ms per packet)
-- ✅ High throughput (100+ anomalies/sec)
-- ✅ Scalable microservices
-- ✅ AI-powered decisions
-- ✅ Comprehensive logging
-- ✅ Easy monitoring & visualization
- 
- 
+
+| Thành phần | Địa chỉ |
+|---|---|
+| Kafka | `localhost:9092` (từ host), `kafka:29092` (trong mạng docker) |
+| packet-capture API | `http://localhost:5001/docs` (host network) |
+| ai-agent API | `http://127.0.0.1:5003` (chỉ mở trên máy chủ) |
+| Prometheus / Grafana | `localhost:9090` / `localhost:3000` |
+
+Ghi chú:
+- packet-capture dùng `network_mode: host` để thấy card mạng thật. Chế độ này chỉ chạy được trên Docker Engine của Linux, Docker Desktop không thấy card mạng thật.
+- ai-agent gọi Ollama trên máy host qua `host.docker.internal:11434`.
+- Nếu Prometheus báo lỗi mount `prometheus.yml`, xem [README_Docker.md](README_Docker.md).
+
+## Nguyên tắc thiết kế
+
+- **Phát hiện theo hành vi, không theo từng gói.** Một gói tin nhìn riêng hầu như không nói lên điều gì. Cảnh báo được tạo từ hồ sơ hành vi của mỗi thiết bị trong một cửa sổ thời gian, kèm lý do và bằng chứng cụ thể.
+- **Cảnh báo giải thích được.** Giai đoạn 1 dùng rule, ARP và baseline thống kê thay cho ML, vì chưa có dữ liệu thật để train. Topic `host_features` đang thu dữ liệu cho giai đoạn ML.
+- **Dữ kiện do hệ thống viết, LLM chỉ giải thích.** IP và số liệu trong thông báo được lấy thẳng từ cảnh báo. Output của LLM bị loại nếu sai schema, chọn hành động ngoài danh sách cho phép, hoặc nhắc tới IP không có trong dữ kiện.
+- **Không có gì tự thực thi.** Lệnh chặn phải qua chính sách, guardrails, rồi người quản trị duyệt. Agent không nắm quyền firewall.
+- **Đổi LLM chỉ cần đổi cấu hình.** Agent gọi LLM qua API tương thích OpenAI, nên chuyển giữa Ollama và vLLM chỉ cần đổi biến môi trường.
+- **Hợp đồng dữ liệu giữa các service được test.** Fixture của mỗi service được sinh bằng code của service phía trước nó.
+
+## Hạn chế hiện tại
+
+- **Chưa chạy end-to-end với Kafka thật.** Test hiện dùng producer/consumer giả lập.
+- **Trạng thái nằm trong RAM:** baseline của anomaly-detection, sự cố và đề xuất đang chờ duyệt của ai-agent mất khi restart.
+- **Mất dữ liệu khi capture dừng.** Khi Kafka gặp sự cố, dữ liệu chỉ được giữ tạm trong RAM của producer.
+- **Bảo mật cần xử lý trước khi triển khai thật:**
+  - API của packet-capture chưa có xác thực và nghe trên `0.0.0.0` trong host network;
+  - API cho phép truyền đường dẫn `pcap_file` tùy ý;
+  - Kafka đang dùng plaintext;
+  - mật khẩu mặc định của InfluxDB và Grafana nằm trong `docker-compose.yml`.
+- **Hạ tầng lưu trữ đã có trong compose nhưng chưa được dùng:** InfluxDB, Elasticsearch, ClickHouse, Redis.
+
+## Lộ trình
+
+1. **action-service:** chạy trên gateway, dry-run trước, chặn có thời hạn, trả kết quả về `action_results`.
+2. **log-storage:** lưu `anomalies` vào Elasticsearch, gom thành sự cố, API `/api/devices/{ip}/history` cho agent.
+3. **anomaly-detection giai đoạn 2:** Isolation Forest train từ `host_features`, phát hiện beaconing.
+4. **Lưu trạng thái:** đưa baseline và đề xuất sang Redis.
+5. **Vận hành:** metrics Prometheus, dashboard Grafana, đánh giá ngưỡng trên dataset công khai (CICIDS2017…).
